@@ -1,0 +1,294 @@
+/*
+ Copyright (C) 2011 James Coliz, Jr. <maniacbug@ymail.com>
+
+ This program is free software; you can redistribute it and/or
+ modify it under the terms of the GNU General Public License
+ version 2 as published by the Free Software Foundation.
+ */
+
+/**
+ * Interrupt-driven test for native target
+ *
+ * This example is the friendliest for the native target because it doesn't do
+ * any polling.  Made a slight change to call done() at the end of setup.
+ */
+
+#include <SPI.h>
+#include "nRF24L01.h"
+#include "RF24.h"
+#include "printf.h"
+#include "MemoryFree.h"
+
+#include <avr/wdt.h> //watchdog timer will reset arduino if hangs for an amount of time
+
+wdt_reset();
+
+//
+// Hardware configuration
+//
+
+// Set up nRF24L01 radio on SPI bus plus pins 8 & 9
+
+RF24 radio(9,10);
+int RFCHANNEL=76;
+
+
+// sets the role of this unit in hardware.  Connect to GND to be the 'pong' receiver
+// Leave open to be the 'ping' transmitter
+const short role_pin = 7;
+
+//
+// Topology
+//
+
+// Single radio pipe address for the 2 nodes to communicate.
+const uint64_t pipe = 0xE8E8F0F0E1LL;
+
+//
+// Role management
+//
+// Set up role.  This sketch uses the same software for all the nodes in this
+// system.  Doing so greatly simplifies testing.  The hardware itself specifies
+// which node it is.
+//
+// This is done through the role_pin
+//
+
+// The various roles supported by this sketch
+typedef enum { role_sender = 1, role_receiver } role_e;
+
+// The debug-friendly names of those roles
+const char* role_friendly_name[] = { "invalid", "Sender", "Receiver"};
+
+// The role of the current running sketch
+role_e role;
+
+// Interrupt handler, check the radio because we got an IRQ
+void check_radio(void);
+long timecheck=0;
+
+int aksRecieved=0;
+int messagesSent=0;
+
+void setup(void)
+{
+
+ wdt_disable(); //in case everything gets stuck in an endless reboot loop
+  
+  //
+  // Role
+  //
+
+pinMode(A0,INPUT);
+pinMode(A1,INPUT);
+pinMode(A2,INPUT);
+pinMode(A3,INPUT);
+pinMode(A4,INPUT);
+pinMode(A5,INPUT);
+pinMode(A6,INPUT);
+pinMode(A7,INPUT);
+
+  // set up the role pin
+  pinMode(role_pin, INPUT);
+  digitalWrite(role_pin,HIGH);
+  delay(20); // Just to get a solid reading on the role pin
+
+  // read the address pin, establish our role
+  if ( digitalRead(role_pin) )
+    role = role_sender;
+  else
+    role = role_receiver;
+
+  //
+  // Print preamble
+  //
+
+  Serial.begin(57600);
+  printf_begin();
+  printf("\n\rRF24/examples/pingpair_irq/\n\r");
+  printf("ROLE: %s\n\r",role_friendly_name[role]);
+
+  //
+  // Setup and configure rf radio
+  //
+
+  radio.begin();
+  //radio.setPALevel( RF24_PA_LOW );
+ radio.setDataRate(RF24_2MBPS);  //speed RF24_250KBPS for 250kbs, RF24_1MBPS for 1Mbps, or RF24_2MBPS for 2Mbps 
+ //higher data rate appears to be more relsiable, but apparently has lower range, which shouldn't be a problem for most stuff
+ radio.setChannel(RFCHANNEL);
+  radio.printDetails();
+  // We will be using the Ack Payload feature, so please enable it
+  radio.enableAckPayload();
+  
+  //
+  // Open pipes to other nodes for communication
+  //
+
+  // This simple sketch opens a single pipe for these two nodes to communicate
+  // back and forth.  One listens on it, the other talks to it.
+
+  if ( role == role_sender )
+  {
+    radio.openWritingPipe(pipe);
+  }
+  else
+  {
+    radio.openReadingPipe(1,pipe);
+  }
+
+  //
+  // Start listening
+  //
+
+  if ( role == role_receiver )
+    radio.startListening();
+
+  //
+  // Dump the configuration of the rf unit for debugging
+  //
+
+//  radio.printDetails();
+
+  //
+  // Attach interrupt handler to interrupt #0 (using pin 2)
+  // on BOTH the sender and receiver
+  //
+
+  attachInterrupt(0, check_radio, FALLING);
+
+  //
+  // On the native target, this is as far as we get
+  //
+#if NATIVE
+  done();
+#endif
+
+wdt_enable(WDTO_4S);
+
+}
+
+static uint32_t message_count = 0;
+
+unsigned long timeint=0;
+
+
+void loop(void)
+{
+  wdt_reset(); //reset timer every loop, if loop takes more than 4 seconds the arduino reboots
+
+  //
+  // Sender role.  Repeatedly send the current time
+  //
+  //  radio.printDetails();
+  if (role == role_sender)
+  {
+    // Take the time, and send it.
+    unsigned long time1 = millis();
+    char temp1[30];
+    String temp2="time = " + String(time1);
+    temp2.toCharArray(temp1,30);
+
+    Serial.print("Now sending: "+ (String)temp1 + "\n");
+    radio.startWrite(&temp1 , sizeof( temp1) );
+    messagesSent++;
+    Serial.println("Messages sent: " + (String)messagesSent + ", Aks recieved: " + (String)aksRecieved + ". Sucess rate: " + (String)((float)aksRecieved/messagesSent*100) + "%");
+    // Try again soon
+
+
+   int ana1=analogRead(A0);
+
+    
+    delay(2000);
+  }
+  check_radio();
+  if ((millis()-timecheck)>4000){
+    
+    printf("not had any activity in 4 seconds \n");
+    if ( role == role_receiver ){
+      radio.stopListening();
+      
+      radio.startListening();
+      }
+    timecheck=millis();
+    }
+  //
+  // Receiver role: Does nothing!  All the work is in IRQ
+  //
+
+  if (role == role_receiver){
+    if (millis()-timeint>60000){
+      radio.printDetails();
+      timeint=millis();
+      }
+    }
+
+}
+
+void check_radio(void)
+{
+  // What happened?
+  bool tx,fail,rx;
+  radio.whatHappened(tx,fail,rx);
+
+  // Have we successfully transmitted?
+  if ( tx )
+  {
+    timecheck=millis();
+    if ( role == role_sender )
+      printf("Send:OK\n\r");
+
+    if ( role == role_receiver )
+      printf("Ack Payload:Sent\n\r");
+  }
+
+  // Have we failed to transmit?
+  if ( fail )
+  {
+    timecheck=millis();
+    if ( role == role_sender )
+      printf("Send:Failed\n\r");
+      
+
+    if ( role == role_receiver )
+      printf("Ack Payload:Failed\n\r");
+  }
+
+  // Transmitter can power down for now, because
+  // the transmission is done.
+  if ( ( tx || fail ) && ( role == role_sender ) )
+    radio.powerDown();
+
+  // Did we receive a message?
+  if ( rx )
+  {
+    timecheck=millis();
+    // If we're the sender, we've received an ack payload
+    if ( role == role_sender )
+    {
+      radio.read(&message_count,sizeof(message_count));
+      printf("Ack:%lu\n\r",(unsigned long)message_count);
+      aksRecieved++;
+    }
+
+    // If we're the receiver, we've received a time message
+    if ( role == role_receiver )
+    {
+      // Get this payload and dump it
+      //static unsigned long got_time;
+      int len = radio.getDynamicPayloadSize();
+      char message_string[30];
+      radio.read( &message_string, sizeof(message_string) );
+      Serial.print("Got payload string ");
+      Serial.println(message_string);
+
+
+      // Add an ack packet for the next time around.  This is a simple
+      // packet counter
+      radio.writeAckPayload( 1, &message_count, sizeof(message_count) );
+      ++message_count;
+    }
+  }
+}
+
+// vim:ai:cin:sts=2 sw=2 ft=cpp
